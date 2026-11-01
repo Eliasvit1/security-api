@@ -4,8 +4,10 @@ Provides secure data endpoints protected by JWT token verification.
 """
 
 import os
+import time
+from collections import defaultdict
 from typing import Optional
-from fastapi import FastAPI, Depends, HTTPException, status
+from fastapi import FastAPI, Depends, HTTPException, Request, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.middleware.cors import CORSMiddleware
 import jwt
@@ -33,6 +35,32 @@ app.add_middleware(
 JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY", "super-secret-jwt-key-2026-secure")
 JWT_ALGORITHM = "HS256"
 security_bearer = HTTPBearer(auto_error=False)
+
+# Rate Limiting Configuration
+RATE_LIMIT_REQUESTS = int(os.getenv("RATE_LIMIT_REQUESTS", "30"))
+RATE_LIMIT_WINDOW = int(os.getenv("RATE_LIMIT_WINDOW", "60"))
+_rate_limit_records = defaultdict(list)
+
+
+def rate_limiter(request: Request):
+    """Enforces client IP rate limiting on sensitive microservice endpoints."""
+    client_ip = request.client.host if request.client else "127.0.0.1"
+    now = time.time()
+    cutoff = now - RATE_LIMIT_WINDOW
+
+    # Remove timestamps outside current rate limit window
+    timestamps = [t for t in _rate_limit_records[client_ip] if t > cutoff]
+
+    if len(timestamps) >= RATE_LIMIT_REQUESTS:
+        retry_after = int(timestamps[0] + RATE_LIMIT_WINDOW - now) + 1
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail=f"Rate limit exceeded: maximum {RATE_LIMIT_REQUESTS} requests per {RATE_LIMIT_WINDOW}s.",
+            headers={"Retry-After": str(max(1, retry_after))},
+        )
+
+    timestamps.append(now)
+    _rate_limit_records[client_ip] = timestamps
 
 
 def verify_jwt_token(credentials: Optional[HTTPAuthorizationCredentials] = Depends(security_bearer)) -> dict:
@@ -67,7 +95,7 @@ def health_check():
     return {"status": "ok", "service": "backend-api"}
 
 
-@app.get("/api/data", tags=["Protected Data"])
+@app.get("/api/data", tags=["Protected Data"], dependencies=[Depends(rate_limiter)])
 def get_secure_data(payload: dict = Depends(verify_jwt_token)):
     """Returns confidential business payload to verified JWT holders."""
     return {
@@ -84,7 +112,7 @@ def get_secure_data(payload: dict = Depends(verify_jwt_token)):
     }
 
 
-@app.post("/api/data", tags=["Protected Data"])
+@app.post("/api/data", tags=["Protected Data"], dependencies=[Depends(rate_limiter)])
 def create_secure_record(record: dict, payload: dict = Depends(verify_jwt_token)):
     """Accepts data records when validated with JWT."""
     return {
